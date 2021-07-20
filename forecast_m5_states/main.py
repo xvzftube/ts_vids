@@ -1,29 +1,71 @@
 import pandas as pd
 from plotnine import *
 from mizani.breaks import date_breaks
+import datetime
+from ngboost import NGBRegressor
+from ngboost.distns import Exponential
+from ngboost.scores import CRPScore
+from scipy.stats import expon
+import numpy as np
 
 df_raw = pd.read_csv("./m5_state_sales.csv")
-df = (df_raw
-        .assign(ds=lambda df: pd.to_datetime(df.date))
-        .assign(year=lambda df: df.ds.dt.year)
+df_raw = (df_raw
+    .assign(ds=lambda df: pd.to_datetime(df.date))
+    .assign(year=lambda df: df.ds.dt.year)
+    .assign(day=lambda df: df.ds.dt.day_name())
+    )
+
+train_max_date = df_raw.ds.max() - datetime.timedelta(weeks=3)
+df_train = df_raw.query('ds <= @train_max_date')
+df_test_zeroes = df_raw.query('ds > @train_max_date').assign(sales=lambda df: df.sales * 0)
+df = df_train.append(df_test_zeroes)
+
+horizon = 21  # 7 * 3
+seasonality = 7  # 7 days
+
+df_roll = (df
+        .assign(lag_sales=lambda df: df.groupby('state_id')['sales'].transform(lambda x: x.shift(horizon)))
+        .assign(lag_sales2=lambda df: df.groupby('state_id')['lag_sales'].transform(lambda x: x.shift(seasonality)))
+        .assign(lag_sales3=lambda df: df.groupby('state_id')['lag_sales'].transform(lambda x: x.shift(seasonality * 2)))
+        .assign(ma1=lambda df: df.groupby(['state_id', 'day'])['lag_sales'].transform(lambda x: x.rolling(window=seasonality).mean()))
+        .assign(ewm1=lambda df: df.groupby(['state_id', 'day'])['lag_sales'].transform(lambda x: x.ewm(span=seasonality).mean()))
         )
 
+df_plotting = df_roll.query('date >= "2015-12-01"')
 theme_set(theme_538)
-palette = ['#ee1d52','#f2d803','#69c9d0','#000000']
+palette = ["#ee1d52", "#f2d803", "#69c9d0", "#000000"]
 p = (
-        ggplot(df, aes(x='ds', y='sales', color = 'state_id')) +
-        geom_point(alpha = .9) +
-        geom_line(alpha = .9) +
-        scale_x_datetime(breaks=date_breaks('1 Year')) +
-        theme(axis_text_x=element_text(angle=45)) +
-        xlab('')+
-        ggtitle('Sales vs Time by State')+
-        scale_color_manual(palette)+
-        facet_wrap(facets='state_id',ncol=1)
-        )
-p.save(filename='../plots/forecast_m5_state_ts.jpg', width=14, height=10)
-
-df = (df.assign(ma_8=df.rolling(window=8).Trips.mean())
-        .assign(lag_8=df.shift(8).Trips)
-        .assign(ewm_8=lambda df: df.lag_8.ewm(0.9).mean())
+    ggplot(df_plotting, aes(x="ds", y="sales", color="state_id"))
+    + geom_line(aes(y = 'lag_sales'), color = 'gray')
+    + geom_line(aes(y = 'lag_sales2'), color = 'gray')
+    + geom_line(aes(y = 'lag_sales3'), color = 'gray')
+    + geom_line(aes(y = 'ma1'), color = 'gray')
+    + geom_line(aes(y = 'ewm1'), color = 'gray')
+    + geom_line()
+    + geom_point()
+    + scale_x_datetime(breaks=date_breaks("1 month"))
+    + theme(axis_text_x=element_text(angle=45))
+    + xlab("")
+    + ggtitle("Sales vs Time by State")
+    + scale_color_manual(palette)
+    + facet_wrap(facets="state_id", ncol=1)
 )
+p.save(filename="../plots/forecast_m5_state_ts_tail.jpg", width=14, height=10)
+
+
+df_prep_boost = df_roll.dropna()
+
+X_train = df_prep_boost.query('ds <= @train_max_date').loc[:, ('lag_sales', 'lag_sales2', 'lag_sales3', 'ma1', 'ewm1')]
+Y_train = df_prep_boost.query('ds <= @train_max_date').loc[:, ('sales')]
+X_test = df_prep_boost.query('ds > @train_max_date').loc[:, ('lag_sales', 'lag_sales2', 'lag_sales3', 'ma1', 'ewm1')]
+Y_test = df_raw.query('ds > @train_max_date').loc[:, ('sales')]
+
+len(Y_test)
+
+ngb_exp = NGBRegressor(Dist=Exponential, verbose=True, Score=CRPScore).fit(X_train, Y_train)
+
+# Y_preds = ngb_exp.predict(X_test)
+Y_dists = ngb_exp.pred_dist(X_test)
+scale0 = Y_dists[0].params.get('scale')
+draw = expon.rvs(loc=0, scale=scale0, size=5000)
+
