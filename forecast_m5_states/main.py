@@ -5,7 +5,7 @@ import datetime
 from ngboost import NGBRegressor
 from ngboost.distns import Exponential
 from ngboost.scores import CRPScore
-from scipy.stats import expon
+from scipy.stats import expon, norm
 import numpy as np
 
 df_raw = pd.read_csv("./m5_state_sales.csv")
@@ -60,12 +60,64 @@ Y_train = df_prep_boost.query('ds <= @train_max_date').loc[:, ('sales')]
 X_test = df_prep_boost.query('ds > @train_max_date').loc[:, ('lag_sales', 'lag_sales2', 'lag_sales3', 'ma1', 'ewm1')]
 Y_test = df_raw.query('ds > @train_max_date').loc[:, ('sales')]
 
-len(Y_test)
-
 ngb_exp = NGBRegressor(Dist=Exponential, verbose=True, Score=CRPScore).fit(X_train, Y_train)
-
-# Y_preds = ngb_exp.predict(X_test)
 Y_dists = ngb_exp.pred_dist(X_test)
-scale0 = Y_dists[0].params.get('scale')
-draw = expon.rvs(loc=0, scale=scale0, size=5000)
+array_crps = np.empty([1, 0])
 
+# ngboost crps
+def crps(y, vec_forecast):
+    x = np.sort(vec_forecast)
+    m = len(vec_forecast)
+    return (2 / m) * np.mean((x - y) * (m * np.where(y < x, 1, 0) - np.arange(start=0, stop=m, step=1) + 1 / 2))
+
+
+np.random.seed(42)
+for i in range(len(X_test)):
+    vec_forecast_ngboost = expon.rvs(loc=0, scale=Y_dists[i].params.get('scale'), size=5000)
+    y = Y_test.iat[i]
+    score = crps(y, vec_forecast_ngboost)
+    array_crps = np.append(array_crps, score)
+
+np.mean(array_crps)
+
+
+# snaive crps
+last_feature_date = train_max_date - datetime.timedelta(weeks=3)
+
+X_train_last = (df_prep_boost
+        .query('ds <= @train_max_date')
+        .groupby(["state_id", "day"], as_index=False)
+        .last())
+X_train_sd = (df_prep_boost
+        .query('ds <= @last_feature_date')
+        .groupby(["state_id", "day"], as_index=False)
+        .std()
+        .loc[:, ('state_id', 'day', 'sales')]
+        .rename(columns={"sales": "sd"}))
+df_last = X_train_last.merge(X_train_sd, on=['state_id', 'day']).loc[:, ('ds', 'state_id', 'day', 'lag_sales', 'sd')].drop(columns=['ds'])
+
+start_forecast = df_prep_boost.query('ds > @train_max_date').ds.min()
+end_forecast = df_prep_boost.query('ds > @train_max_date').ds.max()
+df_dr = pd.DataFrame({"ds": pd.date_range(start=start_forecast, end=end_forecast)}).assign(day=lambda df: df.ds.dt.day_name())
+df_states = pd.DataFrame({"state_id": X_train_last.state_id.unique()})
+
+df_snaive = (df_dr
+        .merge(df_states, how="cross")
+        .merge(df_last, on=['state_id', 'day'])
+        .assign(k=lambda df: df.groupby(['state_id', 'day'], as_index=False).cumcount() + 1)
+        .assign(sd_hat=lambda df: df.sd * np.sqrt(df.k + 1)))
+
+
+array_crps_snaive = np.empty([1, 0])
+
+for i in range(len(X_test)):
+    vec_forecast_snaive = norm.rvs(loc=df_snaive.lag_sales.iat[i], scale=df_snaive.sd_hat.iat[i], size=5000)
+    y = Y_test.iat[i]
+    score = crps(y, vec_forecast_snaive)
+    array_crps_snaive = np.append(array_crps_snaive, score)
+
+
+#ngboost - tuning
+np.mean(array_crps)
+#snaive
+np.mean(array_crps_snaive)
